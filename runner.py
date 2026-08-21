@@ -1,0 +1,326 @@
+"""Async dual-channel deploy runner."""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import suppress
+from dataclasses import dataclass
+import logging
+import queue
+import sys
+import time
+from typing import Any
+
+import numpy as np
+
+from control.executor import Executor, ExecutorConfig
+from common.trace_log import TraceConfig, TraceLogger, set_tracer
+from protocol.base import DEFAULT_PROMPT, InternalObs, get_adapter
+from transport.action_receiver import ActionChunkMsg, ActionReceiver
+from transport.obs_sender import ObsSender, fake_obs_factory
+from transport.ws_client import RoleWebsocketClient
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DeployConfig:
+    host: str = "192.168.81.88"
+    port: int = 8000
+    protocol: str = "pi05"
+    prompt: str = DEFAULT_PROMPT
+    send_hz: float = 30.0
+    chunk_hz: float = 30.0
+    ctrl_hz: float = 250.0
+    blend_s: float = 0.12
+    max_step_delta_rad: float = 0.15
+    freeze_chassis: bool = True
+    freeze_torso: bool = False
+    freeze_head: bool = False
+    dry_run: bool = False
+    fake_sensors: bool = False
+    move_init: bool = True
+    init_duration_s: float = 3.0
+    use_obs_timestamp: bool = True
+    playback_lead_s: float = 0.05
+    image_size: int = 224
+    max_runtime_s: float = 0.0
+    max_chunks: int = 0  # stop after N received action chunks (0=forever)
+    trace: bool = False
+    trace_dir: str = "action_logs/async_trace"
+    trace_every_send: int = 10
+    trace_every_recv: int = 1
+    trace_every_exec: int = 50
+    trace_save_arrays_every: int = 10
+    trace_save_images: bool = False
+    trace_full_vectors: bool = True
+    blend_grippers: bool = False
+    gripper_binary: bool = True
+    gripper_close_enter: float = 60.0
+    gripper_open_enter: float = 40.0
+    gripper_close_confirm: int = 1
+    gripper_open_confirm: int = 2
+    gripper_min_close_hold_s: float = 0.8
+    gripper_min_open_hold_s: float = 0.35
+    gripper_min_close_hold_frames: int = 0
+    gripper_deadband: float = 0.0
+    stdin_reset: bool = True
+    auto_episode_reset: bool = True
+    auto_episode_reset_open_s: float = 0.6
+    auto_episode_reset_delay_s: float = 0.5
+
+
+class FakeJointIO:
+    """No-op joint I/O for connectivity tests."""
+
+    def __init__(self) -> None:
+        self._q = np.zeros(25, dtype=np.float32)
+        self.commands: list[np.ndarray] = []
+
+    def read_joint_state_25(self) -> np.ndarray:
+        return self._q.copy()
+
+    def send_joint_position_command(self, cmd: np.ndarray, *, include_grippers: bool = True) -> None:
+        self._q = np.asarray(cmd, dtype=np.float32).copy()
+        self.commands.append(self._q.copy())
+
+    def stop(self) -> None:
+        pass
+
+    def move_to_collection_init(self, *, duration_s: float = 3.0) -> None:
+        pass
+
+
+class AsyncDeployRunner:
+    def __init__(self, config: DeployConfig) -> None:
+        self._cfg = config
+        self._adapter = get_adapter(config.protocol, image_size=config.image_size)
+        self._chunk_queue: queue.Queue[ActionChunkMsg] = queue.Queue(maxsize=8)
+
+    def run(self) -> None:
+        asyncio.run(self._run_async())
+
+    async def _reset_episode(
+        self,
+        *,
+        executor: Executor,
+        sender: ObsSender,
+        joint_io: Any,
+    ) -> None:
+        logger.info("Episode reset requested")
+        executor.pause()
+        await asyncio.sleep(2.0 / max(self._cfg.ctrl_hz, 1e-3))
+        executor.reset()
+        with suppress(Exception):
+            await sender.send_reset()
+        if self._cfg.move_init:
+            await asyncio.to_thread(
+                joint_io.move_to_collection_init,
+                duration_s=self._cfg.init_duration_s,
+            )
+        executor.reset()
+        executor.resume()
+        logger.info("Episode reset complete")
+
+    async def _stdin_reset_loop(
+        self,
+        *,
+        executor: Executor,
+        sender: ObsSender,
+        joint_io: Any,
+    ) -> None:
+        logger.info("Press 'r' + Enter to reset episode")
+        while True:
+            line = await asyncio.to_thread(sys.stdin.readline)
+            if line == "":
+                await asyncio.sleep(0.5)
+                continue
+            cmd = line.strip().lower()
+            if cmd in ("r", "reset"):
+                await self._reset_episode(executor=executor, sender=sender, joint_io=joint_io)
+
+    async def _auto_reset_loop(
+        self,
+        *,
+        executor: Executor,
+        sender: ObsSender,
+        joint_io: Any,
+    ) -> None:
+        while True:
+            await asyncio.sleep(0.05)
+            if not executor.pop_episode_complete():
+                continue
+            logger.info(
+                "Episode complete detected; resetting in %.2fs",
+                self._cfg.auto_episode_reset_delay_s,
+            )
+            await asyncio.sleep(max(0.0, self._cfg.auto_episode_reset_delay_s))
+            await self._reset_episode(executor=executor, sender=sender, joint_io=joint_io)
+
+    async def _run_async(self) -> None:
+        ros_mw = None
+        joint_io: Any
+        camera = None
+        tracer: TraceLogger | None = None
+        if self._cfg.trace:
+            save_every = self._cfg.trace_save_arrays_every
+            # Short verification runs: dump arrays every chunk/send by default.
+            if self._cfg.max_chunks > 0 and save_every == 10:
+                save_every = 1
+            tracer = TraceLogger(
+                TraceConfig(
+                    enabled=True,
+                    out_dir=self._cfg.trace_dir,
+                    every_send=self._cfg.trace_every_send,
+                    every_recv=self._cfg.trace_every_recv,
+                    every_exec=self._cfg.trace_every_exec,
+                    save_arrays_every=save_every,
+                    full_vectors=self._cfg.trace_full_vectors,
+                    save_images=self._cfg.trace_save_images,
+                )
+            )
+            set_tracer(tracer)
+
+        if self._cfg.fake_sensors:
+            joint_io = FakeJointIO()
+            obs_factory = fake_obs_factory(self._cfg.prompt)
+            logger.info("Fake-sensor mode")
+        else:
+            from robot.camera_reader import CameraReader
+            from robot.joint_io import JointIO
+            from robot.sdk_env import import_astribot_sdk
+
+            ros_mw, Astribot = import_astribot_sdk()
+            astribot = Astribot(freq=self._cfg.ctrl_hz, high_control_rights=True)
+            joint_io = JointIO(astribot, control_way="filter", gripper_control_way="direct")
+            camera = CameraReader(astribot)
+            if self._cfg.move_init:
+                logger.info("Moving to collection init (%.1fs)...", self._cfg.init_duration_s)
+                joint_io.move_to_collection_init(duration_s=self._cfg.init_duration_s)
+
+            def obs_factory() -> InternalObs | None:
+                try:
+                    frames, stamps = camera.read_rgb_with_stamps(wait_timeout_s=0.0)
+                except TimeoutError:
+                    return None
+                q = joint_io.read_joint_state_25()
+                now = time.perf_counter()
+                return InternalObs(
+                    head_rgb=frames["observation/image"],
+                    left_rgb=frames["observation/wrist_image"],
+                    right_rgb=frames["observation/wrist_image_right"],
+                    state_25_sdk=q,
+                    obs_timestamp=now,
+                    head_stamp=stamps["observation/image"],
+                    left_stamp=stamps["observation/wrist_image"],
+                    right_stamp=stamps["observation/wrist_image_right"],
+                    prompt=self._cfg.prompt,
+                )
+
+        sender_client = RoleWebsocketClient(self._cfg.host, self._cfg.port)
+        receiver_client = RoleWebsocketClient(self._cfg.host, self._cfg.port)
+        sender = ObsSender(
+            sender_client,
+            self._adapter,
+            obs_factory,
+            send_hz=self._cfg.send_hz,
+            prompt=self._cfg.prompt,
+        )
+        receiver = ActionReceiver(receiver_client, self._adapter, self._chunk_queue)
+        executor = Executor(
+            joint_io,
+            self._chunk_queue,
+            ExecutorConfig(
+                ctrl_hz=self._cfg.ctrl_hz,
+                chunk_hz=self._cfg.chunk_hz,
+                blend_s=self._cfg.blend_s,
+                max_step_delta_rad=self._cfg.max_step_delta_rad,
+                freeze_chassis=self._cfg.freeze_chassis,
+                freeze_torso=self._cfg.freeze_torso,
+                freeze_head=self._cfg.freeze_head,
+                dry_run=self._cfg.dry_run,
+                use_obs_timestamp=self._cfg.use_obs_timestamp,
+                playback_lead_s=self._cfg.playback_lead_s,
+                blend_grippers=self._cfg.blend_grippers,
+                gripper_binary=self._cfg.gripper_binary,
+                gripper_close_enter=self._cfg.gripper_close_enter,
+                gripper_open_enter=self._cfg.gripper_open_enter,
+                gripper_close_confirm=self._cfg.gripper_close_confirm,
+                gripper_open_confirm=self._cfg.gripper_open_confirm,
+                gripper_min_close_hold_s=self._cfg.gripper_min_close_hold_s,
+                gripper_min_open_hold_s=self._cfg.gripper_min_open_hold_s,
+                gripper_min_close_hold_frames=self._cfg.gripper_min_close_hold_frames,
+                gripper_deadband=self._cfg.gripper_deadband,
+                auto_episode_reset_open_s=self._cfg.auto_episode_reset_open_s,
+            ),
+        )
+
+        logger.info(
+            "Starting async deploy: host=%s:%d protocol=%s dry_run=%s fake=%s",
+            self._cfg.host,
+            self._cfg.port,
+            self._cfg.protocol,
+            self._cfg.dry_run,
+            self._cfg.fake_sensors,
+        )
+        executor.start()
+        send_task = asyncio.create_task(sender.run(), name="obs-sender")
+        recv_task = asyncio.create_task(receiver.run(), name="action-receiver")
+        reset_task = None
+        if self._cfg.stdin_reset and sys.stdin.isatty():
+            reset_task = asyncio.create_task(
+                self._stdin_reset_loop(executor=executor, sender=sender, joint_io=joint_io),
+                name="stdin-reset",
+            )
+        auto_reset_task = None
+        if self._cfg.auto_episode_reset:
+            auto_reset_task = asyncio.create_task(
+                self._auto_reset_loop(executor=executor, sender=sender, joint_io=joint_io),
+                name="auto-reset",
+            )
+
+        try:
+            if self._cfg.max_chunks > 0:
+                logger.info("Will stop after %d action chunks", self._cfg.max_chunks)
+                while executor.chunks_seen < self._cfg.max_chunks:
+                    await asyncio.sleep(0.05)
+                # Let one more control tick flush traces.
+                await asyncio.sleep(0.2)
+                logger.info("Reached max_chunks=%d (seen=%d)", self._cfg.max_chunks, executor.chunks_seen)
+            elif self._cfg.max_runtime_s > 0:
+                await asyncio.sleep(self._cfg.max_runtime_s)
+            else:
+                await asyncio.Future()  # run forever until cancelled
+        except asyncio.CancelledError:
+            pass
+        except KeyboardInterrupt:
+            logger.info("Interrupted")
+        finally:
+            sender.stop()
+            receiver.stop()
+            if reset_task is not None:
+                reset_task.cancel()
+            if auto_reset_task is not None:
+                auto_reset_task.cancel()
+            send_task.cancel()
+            recv_task.cancel()
+            tasks = [send_task, recv_task]
+            if reset_task is not None:
+                tasks.append(reset_task)
+            if auto_reset_task is not None:
+                tasks.append(auto_reset_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            with suppress(Exception):
+                await sender.send_reset()
+            await sender_client.close()
+            await receiver_client.close()
+            executor.stop()
+            with suppress(Exception):
+                joint_io.stop()
+            if ros_mw is not None:
+                with suppress(Exception):
+                    ros_mw.shutdown()
+            if tracer is not None:
+                tracer.close()
+                set_tracer(None)
+            logger.info("Stopped; chunks_seen=%d", executor.chunks_seen)
