@@ -15,4 +15,7 @@ set -u
 export ASTRIBOT_SDK_ROOT="${SDK_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
 
-exec python3 "${REPO_ROOT}/run_async_deploy.py" "$@"
+# Defaults before "$@" so explicit CLI flags can override.
+exec python3 "${REPO_ROOT}/run_async_deploy.py" \
+    --chunk-hz 30 \
+    "$@"

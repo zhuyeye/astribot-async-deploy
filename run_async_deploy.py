@@ -39,6 +39,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ctrl-hz", type=float, default=250.0, help="SDK command rate")
     p.add_argument("--blend-s", type=float, default=0.12, help="Cross-chunk blend seconds")
     p.add_argument("--max-step-delta", type=float, default=0.15)
+    p.add_argument(
+        "--control-way",
+        choices=("filter", "direct"),
+        default="filter",
+        help="SDK control mode for body joints (filter smoother, direct more responsive).",
+    )
+    p.add_argument(
+        "--filter-scale",
+        type=float,
+        default=None,
+        help="Override SDK filter_scale when --control-way=filter. Lower is smoother; to be more responsive increase it.",
+    )
+    p.add_argument(
+        "--gripper-filter-scale",
+        type=float,
+        default=None,
+        help="Override SDK gripper_filter_scale when --control-way=filter.",
+    )
     p.add_argument("--freeze-chassis", action="store_true", default=True)
     p.add_argument("--no-freeze-chassis", action="store_false", dest="freeze_chassis")
     p.add_argument("--freeze-torso", action="store_true")
@@ -164,6 +182,9 @@ def main() -> None:
         ctrl_hz=args.ctrl_hz,
         blend_s=args.blend_s,
         max_step_delta_rad=args.max_step_delta,
+        control_way=args.control_way,
+        filter_scale=args.filter_scale,
+        gripper_filter_scale=args.gripper_filter_scale,
         freeze_chassis=args.freeze_chassis,
         freeze_torso=args.freeze_torso,
         freeze_head=args.freeze_head,

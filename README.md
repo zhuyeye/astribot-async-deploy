@@ -59,7 +59,7 @@ Expect logs with `Ingested chunk` / `chunks_seen>0`.
   --host <GPU_IP> --port 8000 \
   --protocol pi05 \
   --prompt "pick up the orange plush toy to the basket" \
-  --ctrl-hz 250 --blend-s 0.12 --freeze-chassis
+  --chunk-hz 30 --ctrl-hz 250 --blend-s 0.12 --freeze-chassis
 ```
 
 ## Protocol switch

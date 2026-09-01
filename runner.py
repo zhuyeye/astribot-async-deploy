@@ -34,6 +34,13 @@ class DeployConfig:
     ctrl_hz: float = 250.0
     blend_s: float = 0.12
     max_step_delta_rad: float = 0.15
+    # SDK control mode for body joints. 'filter' is smoother but can feel laggy;
+    # 'direct' is more responsive but may increase jitter.
+    control_way: str = "filter"
+    # Optional: override SDK filter parameters (only meaningful when control_way="filter").
+    # SDK comment: lower is higher smooth, so to be more responsive you typically increase this.
+    filter_scale: float | None = None
+    gripper_filter_scale: float | None = None
     freeze_chassis: bool = True
     freeze_torso: bool = False
     freeze_head: bool = False
@@ -192,7 +199,21 @@ class AsyncDeployRunner:
 
             ros_mw, Astribot = import_astribot_sdk()
             astribot = Astribot(freq=self._cfg.ctrl_hz, high_control_rights=True)
-            joint_io = JointIO(astribot, control_way="filter", gripper_control_way="direct")
+            if self._cfg.control_way == "filter" and (self._cfg.filter_scale is not None or self._cfg.gripper_filter_scale is not None):
+                # SDK: lower filter_scale = more smoothing/less responsive.
+                # Provide a fallback when only one side is set.
+                filter_scale = self._cfg.filter_scale if self._cfg.filter_scale is not None else self._cfg.gripper_filter_scale
+                gripper_filter_scale = (
+                    self._cfg.gripper_filter_scale
+                    if self._cfg.gripper_filter_scale is not None
+                    else (self._cfg.filter_scale if self._cfg.filter_scale is not None else filter_scale)
+                )
+                astribot.set_filter_parameters(float(filter_scale), float(gripper_filter_scale))
+            joint_io = JointIO(
+                astribot,
+                control_way=self._cfg.control_way,
+                gripper_control_way="direct",
+            )
             camera = CameraReader(astribot)
             if self._cfg.move_init:
                 logger.info("Moving to collection init (%.1fs)...", self._cfg.init_duration_s)
