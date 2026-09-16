@@ -34,11 +34,11 @@ class ExecutorConfig:
     playback_lead_s: float = 0.05
     blend_grippers: bool = False
     gripper_binary: bool = True
-    gripper_close_enter: float = 60.0
+    gripper_close_enter: float = 70.0
     gripper_open_enter: float = 40.0
-    gripper_close_confirm: int = 1
-    gripper_open_confirm: int = 2
-    gripper_min_close_hold_s: float = 0.8
+    gripper_close_confirm: int = 2
+    gripper_open_confirm: int = 5
+    gripper_min_close_hold_s: float = 1.2
     gripper_min_open_hold_s: float = 0.35
     gripper_min_close_hold_frames: int = 0
     gripper_deadband: float = 0.0

@@ -24,8 +24,8 @@ class GripperPostConfig:
     """Binary gripper hysteresis on SDK [0,100] (== wire [0,1] * 100).
 
     Default band matches classic Schmitt trigger:
-      open  → close when value >= close_enter (60 / 0.6)
-      close → open  when value <= open_enter  (40 / 0.4)
+      open  → close when value >= close_enter (70)
+      close → open  when value <= open_enter  (40)
       otherwise keep current state
 
     After open→close, open is blocked for ``min_close_hold_s`` on the keyframe
@@ -37,13 +37,12 @@ class GripperPostConfig:
     binary: bool = True
     open_value: float = 0.0
     close_value: float = 100.0
-    # Wire 0.6 / 0.4 → SDK 60 / 40
-    close_enter: float = 60.0
+    close_enter: float = 70.0
     open_enter: float = 40.0
-    close_confirm: int = 1
-    open_confirm: int = 2
+    close_confirm: int = 2
+    open_confirm: int = 5
     # One-shot hold after open→close before open is allowed.
-    min_close_hold_s: float = 0.8
+    min_close_hold_s: float = 1.2
     # One-shot hold after close→open before close is allowed.
     min_open_hold_s: float = 0.35
     # Optional extra hold counted in processed keyframes (usually leave 0).

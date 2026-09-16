@@ -17,7 +17,14 @@ def _run(pp: GripperPostProcessor, wire: list[float], *, t0: float = 0.0, hz: fl
 def test_hysteresis_schmitt_example():
     """Match: 0.2 0.5 0.7 0.55 0.45 0.3 → 开 开 合 合 合 开 (hold disabled)."""
     pp = GripperPostProcessor(
-        GripperPostConfig(min_close_hold_s=0.0, min_close_hold_frames=0, open_confirm=1)
+        GripperPostConfig(
+            min_close_hold_s=0.0,
+            min_close_hold_frames=0,
+            open_confirm=1,
+            close_confirm=1,
+            close_enter=60.0,
+            open_enter=40.0,
+        )
     )
     pp.seed_from_state(np.zeros(25, dtype=np.float32))  # open
 
@@ -34,6 +41,8 @@ def test_min_close_hold_edge_only_no_refresh():
             min_close_hold_frames=0,
             chunk_hz=20.0,
             open_confirm=1,
+            close_confirm=1,
+            close_enter=60.0,
         )
     )
     pp.seed_from_state(np.zeros(25, dtype=np.float32))
@@ -49,6 +58,8 @@ def test_min_close_hold_edge_only_no_refresh():
             min_close_hold_frames=0,
             chunk_hz=20.0,
             open_confirm=1,
+            close_confirm=1,
+            close_enter=60.0,
         )
     )
     pp.seed_from_state(np.zeros(25, dtype=np.float32))
@@ -58,7 +69,15 @@ def test_min_close_hold_edge_only_no_refresh():
 
 
 def test_default_open_confirm_rejects_single_frame_open_dip():
-    pp = GripperPostProcessor(GripperPostConfig(min_close_hold_s=0.0, chunk_hz=30.0))
+    pp = GripperPostProcessor(
+        GripperPostConfig(
+            min_close_hold_s=0.0,
+            open_confirm=5,
+            close_confirm=1,
+            close_enter=70.0,
+            chunk_hz=30.0,
+        )
+    )
     pp.seed_from_state(np.zeros(25, dtype=np.float32))
 
     out = _run(pp, [0.8, 1.0, 1.0, 0.22], t0=0.0, hz=30.0)
@@ -67,7 +86,15 @@ def test_default_open_confirm_rejects_single_frame_open_dip():
 
 
 def test_default_open_confirm_allows_sustained_open_intent():
-    pp = GripperPostProcessor(GripperPostConfig(min_close_hold_s=0.0, chunk_hz=30.0))
+    pp = GripperPostProcessor(
+        GripperPostConfig(
+            min_close_hold_s=0.0,
+            open_confirm=2,
+            close_confirm=1,
+            close_enter=60.0,
+            chunk_hz=30.0,
+        )
+    )
     pp.seed_from_state(np.zeros(25, dtype=np.float32))
 
     out = _run(pp, [0.8, 0.2, 0.2, 0.2], t0=0.0, hz=30.0)
@@ -76,7 +103,15 @@ def test_default_open_confirm_allows_sustained_open_intent():
 
 
 def test_default_close_hold_blocks_early_open_after_grasp():
-    pp = GripperPostProcessor(GripperPostConfig(chunk_hz=10.0))
+    pp = GripperPostProcessor(
+        GripperPostConfig(
+            min_close_hold_s=1.2,
+            open_confirm=5,
+            close_confirm=1,
+            close_enter=70.0,
+            chunk_hz=10.0,
+        )
+    )
     pp.seed_from_state(np.zeros(25, dtype=np.float32))
 
     out = _run(pp, [0.8, 0.0, 0.0, 0.0, 0.0], t0=0.0, hz=10.0)

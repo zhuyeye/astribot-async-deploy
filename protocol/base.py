@@ -105,9 +105,10 @@ class ProtocolAdapter(ABC):
 
 
 def gripper_sdk_to_server(state_25: np.ndarray) -> np.ndarray:
+    """Pass gripper dims through in SDK [0,100]; server normalizes itself."""
     state = np.asarray(state_25, dtype=np.float32).copy()
-    state[LEFT_GRIPPER_IDX] = np.clip(state[LEFT_GRIPPER_IDX] / 100.0, 0.0, 1.0)
-    state[RIGHT_GRIPPER_IDX] = np.clip(state[RIGHT_GRIPPER_IDX] / 100.0, 0.0, 1.0)
+    state[LEFT_GRIPPER_IDX] = np.clip(state[LEFT_GRIPPER_IDX], 0.0, 100.0)
+    state[RIGHT_GRIPPER_IDX] = np.clip(state[RIGHT_GRIPPER_IDX], 0.0, 100.0)
     return state
 
 

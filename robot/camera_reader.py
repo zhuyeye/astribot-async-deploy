@@ -41,7 +41,7 @@ class CameraReader:
             status = self._astribot.get_cameras_info()
             if all(status.get(name, {}).get("activate") for name in sdk_names):
                 break
-            time.sleep(1.0)
+            time.sleep(0.2)
         else:
             status = self._astribot.get_cameras_info()
             inactive = [name for name in sdk_names if not status.get(name, {}).get("activate")]

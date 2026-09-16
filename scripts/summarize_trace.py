@@ -77,7 +77,7 @@ def main() -> None:
         )
 
     print(
-        "\nCheck: wire_grip ≈ sdk_grip/100 on send; "
+        "\nCheck: wire_grip ≈ sdk_grip on send (no /100); "
         "sdk_grip ≈ raw_grip*100 on recv; "
         "ingest after differs from before only on early non-gripper frames when blend_n>0."
     )

@@ -18,7 +18,11 @@ from protocol.base import (
 
 
 class Pi05Adapter(ProtocolAdapter):
-    """observation/* keys, state/action (T, 25), gripper [0,1] on wire."""
+    """observation/* keys, state/action (T, 25).
+
+    Obs gripper stays SDK [0,100] (server normalizes). Action gripper wire is
+    still [0,1] and is scaled to SDK [0,100] on decode.
+    """
 
     name = "pi05"
 

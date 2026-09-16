@@ -118,15 +118,15 @@ def parse_args() -> argparse.Namespace:
         help="Binarize grippers to {0,100} AFTER blend (default: on)",
     )
     p.add_argument("--no-gripper-binary", action="store_false", dest="gripper_binary")
-    p.add_argument("--gripper-close-enter", type=float, default=60.0, help="SDK units; wire 0.6 → close")
-    p.add_argument("--gripper-open-enter", type=float, default=40.0, help="SDK units; wire 0.4 → open")
-    p.add_argument("--gripper-close-confirm", type=int, default=1)
-    p.add_argument("--gripper-open-confirm", type=int, default=2)
+    p.add_argument("--gripper-close-enter", type=float, default=70.0, help="SDK units; >= → want close (default 70)")
+    p.add_argument("--gripper-open-enter", type=float, default=40.0, help="SDK units; <= → want open (default 40)")
+    p.add_argument("--gripper-close-confirm", type=int, default=2, help="Consecutive close-intent frames to close (default 2)")
+    p.add_argument("--gripper-open-confirm", type=int, default=5, help="Consecutive open-intent frames to open (default 5)")
     p.add_argument(
         "--gripper-min-close-hold-s",
         type=float,
-        default=0.8,
-        help="One-shot hold after open→close before open allowed (default 0.8s; not refreshed by sustained close)",
+        default=1.2,
+        help="One-shot hold after open→close before open allowed (default 1.2s; not refreshed by sustained close)",
     )
     p.add_argument(
         "--gripper-min-open-hold-s",

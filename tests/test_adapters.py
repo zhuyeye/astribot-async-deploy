@@ -34,8 +34,10 @@ def test_pi05_roundtrip_actions():
     wire = adapter.encode_obs(obs)
     assert "observation/image" in wire
     assert wire["observation/state"].shape == (25,)
-    # grippers scaled to [0,1]
-    assert wire["observation/state"][14] <= 1.0
+    # grippers stay SDK [0,100] on wire; server normalizes
+    assert abs(float(wire["observation/state"][14]) - float(obs.state_25_sdk[14])) < 1e-3
+    assert abs(float(wire["observation/state"][22]) - float(obs.state_25_sdk[22])) < 1e-3
+    assert float(wire["observation/state"][14]) <= 100.0
 
     actions = np.zeros((10, 25), dtype=np.float32)
     actions[:, 14] = 0.5

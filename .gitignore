@@ -11,5 +11,6 @@ venv/
 dist/
 build/
 action_logs/
+sim_preview/
 *.npz
 .DS_Store

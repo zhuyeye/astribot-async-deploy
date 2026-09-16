@@ -26,13 +26,13 @@ class ChunkTrajConfig:
     # open/close band, then binary sticky discretizes to {0,100}.
     blend_grippers: bool = False
     gripper_binary: bool = True
-    # Hysteresis on SDK [0,100]: close >=60 (wire 0.6), open <=40 (wire 0.4).
-    gripper_close_enter: float = 60.0
+    # Hysteresis on SDK [0,100]: close >=70, open <=40.
+    gripper_close_enter: float = 70.0
     gripper_open_enter: float = 40.0
-    gripper_close_confirm: int = 1
-    gripper_open_confirm: int = 2
+    gripper_close_confirm: int = 2
+    gripper_open_confirm: int = 5
     # One-shot hold after open→close before open is allowed.
-    gripper_min_close_hold_s: float = 0.8
+    gripper_min_close_hold_s: float = 1.2
     gripper_min_open_hold_s: float = 0.35
     gripper_min_close_hold_frames: int = 0
     gripper_deadband: float = 0.0
@@ -45,7 +45,8 @@ class ChunkTrajBridge:
       1) linear blend ``blend_s`` keyframes at the ingest seam (``k_now`` on the
          obs_timestamp timeline when enabled, else key 0) from last sample
          (arms/joints; grippers only if ``blend_grippers``)
-      2) discretize grippers (binary sticky) on the (mostly raw) gripper keys
+      2) discretize grippers (binary sticky) only on the playable suffix
+         ``[k_now:]`` so discarded prefix frames cannot advance confirm/hold
       3) sample: joints linear; grippers ZOH after discretization
     """
 
@@ -118,16 +119,17 @@ class ChunkTrajBridge:
                 t0 = now + lead_s
 
         times = t0 + np.arange(horizon, dtype=np.float64) / float(self._cfg.chunk_hz)
+        # Playable seam on the (possibly rebased) timeline; used for blend + gripper post.
+        k_now = self._blend_start_index(t0=t0, now=now, horizon=horizon)
 
         with self._lock:
             prev_sample = self._last_sample.copy() if self._last_sample is not None else None
             before = actions.copy()
             keys = actions.copy()
             blend_n = 0
-            blend_k0 = 0
+            blend_k0 = k_now
             if prev_sample is not None and self._cfg.blend_s > 0:
                 blend_n = max(1, int(round(self._cfg.blend_s * self._cfg.chunk_hz)))
-                blend_k0 = self._blend_start_index(t0=t0, now=now, horizon=horizon)
                 blend_end = min(horizon, blend_k0 + blend_n)
                 blend_count = blend_end - blend_k0
                 if blend_count > 0:
@@ -144,10 +146,18 @@ class ChunkTrajBridge:
                     blend_n = 0
 
             after_blend = keys.copy()
-            # Discretize / smooth grippers AFTER blend (timeline = traj times).
-            keys = self._gripper_post.process_keyframes(
-                keys, t0=float(t0), hz=float(self._cfg.chunk_hz)
+            # Binarize only the playable suffix so discarded prefix cannot
+            # advance open_confirm / close_confirm / hold state.
+            suffix = keys[k_now:].copy()
+            suffix = self._gripper_post.process_keyframes(
+                suffix,
+                t0=float(times[k_now]),
+                hz=float(self._cfg.chunk_hz),
             )
+            keys[k_now:] = suffix
+            if k_now > 0:
+                for gi in GRIPPER_INDICES:
+                    keys[:k_now, gi] = keys[k_now, gi]
 
             self._times = times
             self._keys = keys
@@ -161,7 +171,7 @@ class ChunkTrajBridge:
                 t0=float(t0),
                 blend_n=blend_n,
                 blend_k0=blend_k0,
-                k_now=blend_k0,
+                k_now=k_now,
                 ingest_now=float(now),
                 after_blend_keys=after_blend,
             )

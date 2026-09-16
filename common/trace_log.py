@@ -185,11 +185,10 @@ class TraceLogger:
             if ws.ndim == 1 and ws.shape[0] >= 25:
                 payload["wire_grip_L"] = float(ws[LEFT_GRIPPER_IDX])
                 payload["wire_grip_R"] = float(ws[RIGHT_GRIPPER_IDX])
-                # Sanity: SDK/100 ≈ wire for grippers.
+                # Obs gripper is passed through in SDK units (no /100).
                 payload["grip_scale_check_L"] = {
                     "sdk": float(np.asarray(internal_state_25).ravel()[LEFT_GRIPPER_IDX]),
                     "wire": float(ws[LEFT_GRIPPER_IDX]),
-                    "sdk_div_100": float(np.asarray(internal_state_25).ravel()[LEFT_GRIPPER_IDX]) / 100.0,
                 }
         for k in (
             "observation/image",

@@ -173,6 +173,55 @@ def test_stale_obs_timestamp_clamps_playback_to_future_lead():
     assert 0.0 < float(s_mid[7]) < 1.0
 
 
+def test_gripper_binary_only_processes_playable_suffix():
+    """Discarded prefix open frames must not burn open_confirm / flip closed→open."""
+    bridge = ChunkTrajBridge(
+        ChunkTrajConfig(
+            chunk_hz=30.0,
+            blend_s=0.0,
+            use_obs_timestamp=True,
+            playback_lead_s=0.0,
+            gripper_binary=True,
+            gripper_close_enter=70.0,
+            gripper_open_enter=40.0,
+            gripper_close_confirm=1,
+            gripper_open_confirm=5,
+            gripper_min_close_hold_s=0.0,
+            gripper_min_open_hold_s=0.0,
+        )
+    )
+    bridge.seed_gripper_from_state(np.zeros(25, dtype=np.float32))
+
+    # First chunk: close on all frames, play from start.
+    a_close = np.zeros((20, 25), dtype=np.float32)
+    a_close[:, 14] = 100.0
+    a_close[:, 22] = 100.0
+    bridge.ingest(a_close, obs_timestamp=100.0, now=100.0)
+    assert float(bridge.sample(100.0)[14]) == 100.0
+
+    # Second chunk arrives with ~5 frames of latency (k_now≈5). Prefix is open,
+    # suffix from k_now is closed. Old bug: processing prefix would open.
+    obs_ts = 100.2
+    now = obs_ts + 5.0 / 30.0  # k_now == 5
+    a2 = np.zeros((20, 25), dtype=np.float32)
+    a2[:5, 14] = 0.0
+    a2[5:, 14] = 100.0
+    a2[:5, 22] = 0.0
+    a2[5:, 22] = 100.0
+    bridge.ingest(a2, obs_timestamp=obs_ts, now=now)
+
+    k_now = bridge._blend_start_index(t0=obs_ts, now=now, horizon=20)  # noqa: SLF001
+    assert k_now == 5
+
+    # Playable seam should stay closed (suffix only saw close intent).
+    cmd = bridge.sample(now)
+    assert cmd is not None
+    assert float(cmd[14]) == 100.0
+    assert float(cmd[22]) == 100.0
+    # Prefix slots are filled from suffix seam for safety.
+    assert float(bridge._keys[0, 14]) == 100.0  # noqa: SLF001
+
+
 def test_fresh_obs_timestamp_keeps_original_timeline():
     bridge = ChunkTrajBridge(
         ChunkTrajConfig(

@@ -6,7 +6,9 @@ import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
 import logging
+import os
 import queue
+import signal
 import sys
 import time
 from typing import Any
@@ -21,6 +23,50 @@ from transport.obs_sender import ObsSender, fake_obs_factory
 from transport.ws_client import RoleWebsocketClient
 
 logger = logging.getLogger(__name__)
+
+# ROS/SDK often replace SIGINT; without this, Ctrl-C appears to do nothing.
+_STOP_SIGNAL_COUNT = 0
+
+
+def _on_stop_signal(stop: asyncio.Event | None = None) -> None:
+    global _STOP_SIGNAL_COUNT
+    _STOP_SIGNAL_COUNT += 1
+    if _STOP_SIGNAL_COUNT >= 2:
+        logger.warning("Forced exit on second Ctrl-C / SIGTERM")
+        os._exit(130)
+    logger.warning("Stop requested (Ctrl-C). Press again to force exit.")
+    if stop is not None:
+        stop.set()
+
+
+def _restore_sync_sigint() -> None:
+    """Raise KeyboardInterrupt in Python even while blocked in time.sleep / SDK."""
+
+    def _handler(_signum: int, _frame: object) -> None:
+        _on_stop_signal(None)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+
+
+def _install_stop_signals(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> None:
+    def _on_stop() -> None:
+        _on_stop_signal(stop)
+
+    def _sync_handler(_signum: int, _frame: object) -> None:
+        try:
+            loop.call_soon_threadsafe(_on_stop)
+        except RuntimeError:
+            os._exit(130)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.remove_signal_handler(sig)
+        try:
+            loop.add_signal_handler(sig, _on_stop)
+        except (NotImplementedError, RuntimeError, ValueError):
+            signal.signal(sig, _sync_handler)
 
 
 @dataclass
@@ -63,11 +109,11 @@ class DeployConfig:
     trace_full_vectors: bool = True
     blend_grippers: bool = False
     gripper_binary: bool = True
-    gripper_close_enter: float = 60.0
+    gripper_close_enter: float = 70.0
     gripper_open_enter: float = 40.0
-    gripper_close_confirm: int = 1
-    gripper_open_confirm: int = 2
-    gripper_min_close_hold_s: float = 0.8
+    gripper_close_confirm: int = 2
+    gripper_open_confirm: int = 5
+    gripper_min_close_hold_s: float = 1.2
     gripper_min_open_hold_s: float = 0.35
     gripper_min_close_hold_frames: int = 0
     gripper_deadband: float = 0.0
@@ -137,14 +183,26 @@ class AsyncDeployRunner:
         joint_io: Any,
     ) -> None:
         logger.info("Press 'r' + Enter to reset episode")
-        while True:
-            line = await asyncio.to_thread(sys.stdin.readline)
-            if line == "":
-                await asyncio.sleep(0.5)
-                continue
-            cmd = line.strip().lower()
-            if cmd in ("r", "reset"):
-                await self._reset_episode(executor=executor, sender=sender, joint_io=joint_io)
+        loop = asyncio.get_running_loop()
+        lines: asyncio.Queue[str] = asyncio.Queue()
+
+        def _on_stdin() -> None:
+            line = sys.stdin.readline()
+            lines.put_nowait(line)
+
+        loop.add_reader(sys.stdin.fileno(), _on_stdin)
+        try:
+            while True:
+                line = await lines.get()
+                if line == "":
+                    await asyncio.sleep(0.5)
+                    continue
+                cmd = line.strip().lower()
+                if cmd in ("r", "reset"):
+                    await self._reset_episode(executor=executor, sender=sender, joint_io=joint_io)
+        finally:
+            with suppress(Exception):
+                loop.remove_reader(sys.stdin.fileno())
 
     async def _auto_reset_loop(
         self,
@@ -169,6 +227,9 @@ class AsyncDeployRunner:
         joint_io: Any
         camera = None
         tracer: TraceLogger | None = None
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        _restore_sync_sigint()
         if self._cfg.trace:
             save_every = self._cfg.trace_save_arrays_every
             # Short verification runs: dump arrays every chunk/send by default.
@@ -199,6 +260,7 @@ class AsyncDeployRunner:
 
             ros_mw, Astribot = import_astribot_sdk()
             astribot = Astribot(freq=self._cfg.ctrl_hz, high_control_rights=True)
+            _restore_sync_sigint()
             if self._cfg.control_way == "filter" and (self._cfg.filter_scale is not None or self._cfg.gripper_filter_scale is not None):
                 # SDK: lower filter_scale = more smoothing/less responsive.
                 # Provide a fallback when only one side is set.
@@ -215,6 +277,7 @@ class AsyncDeployRunner:
                 gripper_control_way="direct",
             )
             camera = CameraReader(astribot)
+            _restore_sync_sigint()
             if self._cfg.move_init:
                 logger.info("Moving to collection init (%.1fs)...", self._cfg.init_duration_s)
                 joint_io.move_to_collection_init(duration_s=self._cfg.init_duration_s)
@@ -285,6 +348,7 @@ class AsyncDeployRunner:
             self._cfg.fake_sensors,
         )
         executor.start()
+        _install_stop_signals(loop, stop)
         send_task = asyncio.create_task(sender.run(), name="obs-sender")
         recv_task = asyncio.create_task(receiver.run(), name="action-receiver")
         reset_task = None
@@ -303,19 +367,25 @@ class AsyncDeployRunner:
         try:
             if self._cfg.max_chunks > 0:
                 logger.info("Will stop after %d action chunks", self._cfg.max_chunks)
-                while executor.chunks_seen < self._cfg.max_chunks:
+                while executor.chunks_seen < self._cfg.max_chunks and not stop.is_set():
                     await asyncio.sleep(0.05)
-                # Let one more control tick flush traces.
-                await asyncio.sleep(0.2)
-                logger.info("Reached max_chunks=%d (seen=%d)", self._cfg.max_chunks, executor.chunks_seen)
+                if not stop.is_set():
+                    await asyncio.sleep(0.2)
+                    logger.info(
+                        "Reached max_chunks=%d (seen=%d)",
+                        self._cfg.max_chunks,
+                        executor.chunks_seen,
+                    )
             elif self._cfg.max_runtime_s > 0:
-                await asyncio.sleep(self._cfg.max_runtime_s)
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=self._cfg.max_runtime_s)
             else:
-                await asyncio.Future()  # run forever until cancelled
+                await stop.wait()
         except asyncio.CancelledError:
             pass
         except KeyboardInterrupt:
-            logger.info("Interrupted")
+            logger.warning("Interrupted")
+            stop.set()
         finally:
             sender.stop()
             receiver.stop()
@@ -330,18 +400,26 @@ class AsyncDeployRunner:
                 tasks.append(reset_task)
             if auto_reset_task is not None:
                 tasks.append(auto_reset_task)
-            await asyncio.gather(*tasks, return_exceptions=True)
-            with suppress(Exception):
-                await sender.send_reset()
-            await sender_client.close()
-            await receiver_client.close()
-            executor.stop()
-            with suppress(Exception):
-                joint_io.stop()
-            if ros_mw is not None:
+
+            async def _cleanup() -> None:
+                await asyncio.gather(*tasks, return_exceptions=True)
                 with suppress(Exception):
-                    ros_mw.shutdown()
-            if tracer is not None:
-                tracer.close()
-                set_tracer(None)
+                    await sender.send_reset()
+                await sender_client.close()
+                await receiver_client.close()
+                executor.stop()
+                with suppress(Exception):
+                    joint_io.stop()
+                if ros_mw is not None:
+                    with suppress(Exception):
+                        ros_mw.shutdown()
+                if tracer is not None:
+                    tracer.close()
+                    set_tracer(None)
+
+            try:
+                await asyncio.wait_for(_cleanup(), timeout=5.0)
+            except (asyncio.TimeoutError, KeyboardInterrupt):
+                logger.error("Shutdown hung; forcing exit")
+                os._exit(130)
             logger.info("Stopped; chunks_seen=%d", executor.chunks_seen)
