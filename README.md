@@ -59,7 +59,23 @@ Expect logs with `Ingested chunk` / `chunks_seen>0`.
   --host <GPU_IP> --port 8000 \
   --protocol pi05 \
   --prompt "pick up the orange plush toy to the basket" \
-  --chunk-hz 30 --ctrl-hz 250 --blend-s 0.12 --freeze-chassis
+  --send-hz 10 --chunk-hz 30 --ctrl-hz 250 --blend-s 0.12 --freeze-chassis
+```
+
+### Proven Costa handover (Orin → `192.168.0.100`)
+
+RTC + causal gripper post (defaults below). Server horizon H=20 is fine with this client.
+
+```bash
+./scripts/start_async.sh \
+  --host 192.168.0.100 --port 8003 \
+  --protocol pi05 \
+  --send-hz 10 --chunk-hz 30 --ctrl-hz 250 \
+  --blend-s 0.12 --freeze-chassis \
+  --gripper-binary \
+  --gripper-close-enter 70 --gripper-open-enter 40 \
+  --gripper-close-confirm 2 --gripper-open-confirm 5 \
+  --gripper-min-close-hold-s 1.2 --gripper-min-open-hold-s 0.35
 ```
 
 ## Protocol switch
@@ -67,11 +83,25 @@ Expect logs with `Ingested chunk` / `chunks_seen>0`.
 - `--protocol pi05` (default): openpi `observation/*`, action `(T,25)`, gripper wire `[0,1]`
 - `--protocol astribot34`: `images.cam_*`, state `(34,)`, action `(T,29..34)` — confirm with server via `SERVER.md` checklist first
 
-## Gripper policy (v1)
+## Gripper policy (locked)
 
-No binary / effector post-process. Gripper travels with arms via
-`set_joints_position(..., control_way=direct)` after `[0,1]→[0,100]` conversion.
-Cross-chunk blend applies to non-gripper joints only; grippers use step-hold.
+Binary sticky hysteresis on SDK `[0,100]` after `[0,1]→[0,100]` decode.
+
+| Knob | Default | Notes |
+|------|---------|--------|
+| `--gripper-binary` | on | `{0,100}` open/close |
+| `--gripper-close-enter` / `--open-enter` | 70 / 40 | Schmitt band |
+| `--gripper-close-confirm` / `--open-confirm` | 2 / 5 | keyframe counts |
+| `--gripper-min-close-hold-s` / `--min-open-hold-s` | 1.2 / 0.35 | one-shot edge holds |
+| `--blend-grippers` | off | arms blend; grippers do not |
+
+**Causal (important):** ingest only stores continuous gripper targets (arm blend
+unchanged). The sticky SM advances on **sample**, only when the active keyframe
+index moves — current + history, never the unplayed chunk tail. Ingest-time
+`process_keyframes` on `[k_now:]` caused H=20 early grasp under RTC
+(`send-hz≈10` plays ~3 frames/chunk while close sat at frames 17–19).
+
+Arms still cross-chunk blend (`--blend-s`); grippers ZOH discrete after the SM.
 
 ## Tests
 

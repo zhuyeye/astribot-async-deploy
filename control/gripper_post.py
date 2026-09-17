@@ -111,6 +111,12 @@ class GripperPostProcessor:
             st.opened_since = None
             st.dip_count = 0
 
+    def last_out(self, idx: int) -> float | None:
+        st = self._sides.get(idx)
+        if st is None:
+            return None
+        return st.last_out
+
     def process_keyframes(
         self,
         keyframe_cmds: np.ndarray,
@@ -118,6 +124,7 @@ class GripperPostProcessor:
         t0: float | None = None,
         hz: float | None = None,
     ) -> np.ndarray:
+        """Batch-process a keyframe series (tests / offline). Prefer ``process_cmd`` online."""
         out = np.asarray(keyframe_cmds, dtype=np.float32).copy()
         if out.ndim != 2 or out.shape[0] == 0:
             return out
@@ -125,13 +132,24 @@ class GripperPostProcessor:
         rate = float(self.config.chunk_hz if hz is None else hz)
         if rate <= 0.0:
             rate = 30.0
+        dt = 1.0 / rate
+        for t in range(int(out.shape[0])):
+            out[t] = self.process_cmd(out[t], t_now=t_base + float(t) * dt)
+        return out
+
+    def process_cmd(self, cmd_25: np.ndarray, *, t_now: float | None = None) -> np.ndarray:
+        """Advance gripper SM one step from current raw cmd (mutates grippers in-place copy)."""
+        out = np.asarray(cmd_25, dtype=np.float32).copy()
+        if out.ndim != 1 or out.shape[0] < 1:
+            return out
+        t = time.monotonic() if t_now is None else float(t_now)
         for _, idx in GRIPPER_SIDES:
-            if idx >= out.shape[1]:
+            if idx >= out.shape[0]:
                 continue
             if self.config.binary:
-                out[:, idx] = self._process_side_binary(idx, out[:, idx], t_base, rate)
+                out[idx] = self._step_side_binary(idx, float(out[idx]), t)
             else:
-                out[:, idx] = self._process_side_continuous(idx, out[:, idx])
+                out[idx] = self._step_side_continuous(idx, float(out[idx]))
         return out
 
     def _apply_deadband(self, st: _SideState, v: float) -> float:
@@ -173,118 +191,104 @@ class GripperPostProcessor:
             return False
         return (float(t_now) - float(st.opened_since)) < hold_s
 
-    def _process_side_binary(
-        self,
-        idx: int,
-        raw: np.ndarray,
-        t_base: float,
-        rate: float,
-    ) -> np.ndarray:
+    def _ensure_binary_seed(self, st: _SideState, raw_v: float, t_now: float) -> None:
+        cfg = self.config
+        if st.closed is not None:
+            return
+        seed = float(raw_v) if st.last_raw is None else float(st.last_raw)
+        seed = float(np.clip(seed, cfg.lo, cfg.hi))
+        st.closed = seed >= cfg.close_enter
+        st.last_raw = seed
+        if st.closed:
+            self._arm_close_hold(st, t_now)
+
+    def _step_side_binary(self, idx: int, raw_v: float, t_now: float) -> float:
         cfg = self.config
         st = self._sides[idx]
-        series = np.clip(np.asarray(raw, dtype=np.float32), cfg.lo, cfg.hi)
-        result = np.empty_like(series)
-        dt = 1.0 / rate
-
-        if st.closed is None:
-            seed = float(series[0]) if st.last_raw is None else float(st.last_raw)
-            st.closed = seed >= cfg.close_enter
-            st.last_raw = seed
-            if st.closed:
-                self._arm_close_hold(st, t_base)
-
+        self._ensure_binary_seed(st, raw_v, t_now)
         assert st.closed is not None
 
-        for t in range(int(series.shape[0])):
-            t_now = t_base + float(t) * dt
-            v = self._apply_deadband(st, float(series[t]))
-            want_close = v >= cfg.close_enter
-            want_open = v <= cfg.open_enter
+        v = self._apply_deadband(st, float(np.clip(raw_v, cfg.lo, cfg.hi)))
+        want_close = v >= cfg.close_enter
+        want_open = v <= cfg.open_enter
 
-            if st.closed:
-                if want_close:
-                    # Sustained close: keep closed, do NOT refresh edge hold.
+        if st.closed:
+            if want_close:
+                # Sustained close: keep closed, do NOT refresh edge hold.
+                st.open_streak = 0
+                st.close_streak = 0
+                out = cfg.close_value
+            elif want_open:
+                if self._close_hold_active(st, t_now):
+                    if st.close_hold_remaining > 0:
+                        st.close_hold_remaining -= 1
                     st.open_streak = 0
-                    st.close_streak = 0
-                    result[t] = cfg.close_value
-                elif want_open:
-                    if self._close_hold_active(st, t_now):
-                        if st.close_hold_remaining > 0:
-                            st.close_hold_remaining -= 1
-                        st.open_streak = 0
-                        result[t] = cfg.close_value
-                    else:
-                        st.open_streak += 1
-                        st.close_streak = 0
-                        if st.open_streak >= max(1, int(cfg.open_confirm)):
-                            st.closed = False
-                            st.open_streak = 0
-                            self._arm_open_hold(st, t_now)
-                            result[t] = cfg.open_value
-                        else:
-                            result[t] = cfg.close_value
+                    out = cfg.close_value
                 else:
-                    st.open_streak = 0
-                    result[t] = cfg.close_value
+                    st.open_streak += 1
+                    st.close_streak = 0
+                    if st.open_streak >= max(1, int(cfg.open_confirm)):
+                        st.closed = False
+                        st.open_streak = 0
+                        self._arm_open_hold(st, t_now)
+                        out = cfg.open_value
+                    else:
+                        out = cfg.close_value
             else:
-                if want_close:
-                    if self._open_hold_active(st, t_now):
-                        if st.open_hold_remaining > 0:
-                            st.open_hold_remaining -= 1
-                        st.close_streak = 0
-                        st.open_streak = 0
-                    else:
-                        st.close_streak += 1
-                        st.open_streak = 0
-                else:
-                    st.close_streak = 0
-                if st.close_streak >= max(1, int(cfg.close_confirm)):
-                    st.closed = True
+                st.open_streak = 0
+                out = cfg.close_value
+        else:
+            if want_close:
+                if self._open_hold_active(st, t_now):
+                    if st.open_hold_remaining > 0:
+                        st.open_hold_remaining -= 1
                     st.close_streak = 0
                     st.open_streak = 0
-                    self._arm_close_hold(st, t_now)
-                    result[t] = cfg.close_value
                 else:
-                    result[t] = cfg.open_value
+                    st.close_streak += 1
+                    st.open_streak = 0
+            else:
+                st.close_streak = 0
+            if st.close_streak >= max(1, int(cfg.close_confirm)):
+                st.closed = True
+                st.close_streak = 0
+                st.open_streak = 0
+                self._arm_close_hold(st, t_now)
+                out = cfg.close_value
+            else:
+                out = cfg.open_value
 
-            st.last_out = float(result[t])
+        st.last_out = float(out)
+        return float(out)
 
-        return result
-
-    def _process_side_continuous(self, idx: int, raw: np.ndarray) -> np.ndarray:
+    def _step_side_continuous(self, idx: int, raw_v: float) -> float:
         cfg = self.config
         st = self._sides[idx]
-        series = np.clip(np.asarray(raw, dtype=np.float32), cfg.lo, cfg.hi)
-        result = np.empty_like(series)
-
+        v = float(np.clip(raw_v, cfg.lo, cfg.hi))
         if st.last_out is None:
-            st.last_out = float(series[0])
-
-        for t in range(series.shape[0]):
-            v = float(series[t])
-            last = float(st.last_out)
-
-            if (
-                cfg.dip_suppress_frames > 0
-                and last >= cfg.high_level
-                and (last - v) >= cfg.dip_depth
-            ):
-                st.dip_count += 1
-                if st.dip_count <= cfg.dip_suppress_frames:
-                    v = last
-            else:
-                st.dip_count = 0
-
-            if abs(v - last) < cfg.deadband:
-                v = last
-
-            lo = last - cfg.max_step_down
-            hi = last + cfg.max_step_up
-            v = float(np.clip(v, lo, hi))
-            v = float(np.clip(v, cfg.lo, cfg.hi))
-
             st.last_out = v
             st.last_raw = v
-            result[t] = v
+            return v
 
-        return result
+        last = float(st.last_out)
+        if (
+            cfg.dip_suppress_frames > 0
+            and last >= cfg.high_level
+            and (last - v) >= cfg.dip_depth
+        ):
+            st.dip_count += 1
+            if st.dip_count <= cfg.dip_suppress_frames:
+                v = last
+        else:
+            st.dip_count = 0
+
+        if abs(v - last) < cfg.deadband:
+            v = last
+
+        lo = last - cfg.max_step_down
+        hi = last + cfg.max_step_up
+        v = float(np.clip(v, lo, hi))
+        v = float(np.clip(v, cfg.lo, cfg.hi))
+        st.last_out = v
+        st.last_raw = v
+        return v

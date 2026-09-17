@@ -92,9 +92,9 @@ Gripper wire units: client auto-detects `[0,1]` vs `[0,100]` on decode.
 ## What the robot does after each chunk
 
 1. Decode `actions` → internal `(T,25)` SDK units (gripper `[0,100]`).
-2. `ChunkTrajBridge`: time-align with `obs_timestamp`, **blend non-gripper** across chunks, **ZOH grippers**.
-3. Control loop at `--ctrl-hz` samples trajectory → `set_joints_position` (grippers included, `control_way=direct`).
-4. No binary gripper / effector post-process in v1.
+2. `ChunkTrajBridge`: time-align with `obs_timestamp`, **blend non-gripper** across chunks; keep **continuous** gripper keys (no ingest lookahead binarize).
+3. Control loop at `--ctrl-hz` samples trajectory; **gripper sticky binary SM runs on sample** (per keyframe advance only) → `set_joints_position` (grippers included).
+4. Do not binarize the full playable suffix at ingest — that closes early when H≫ frames actually played (RTC).
 
 ## Contact fields for server reply
 

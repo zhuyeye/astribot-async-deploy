@@ -1,7 +1,7 @@
 ---
 id: astribot-async-deploy
 status: active
-updated: 2026-08-21
+updated: 2026-09-17
 phase: rtc-live-validation
 related:
   - openpi-client
@@ -34,7 +34,7 @@ fake → dry-run → 真机执行；chunk 时序、blend、夹爪策略可复现
 - [x] fake server + 本地连通性验证路径
 - [ ] 与 GPU async policy server 的正式联调 checklist 闭环
 - [ ] 真机 RTC / live 行为稳定可复现（含 trace 分析）
-- [ ] 夹爪策略与协议单位约定文档化并锁定
+- [x] 夹爪策略与协议单位约定文档化并锁定（因果 SM + Costa 推荐参数）
 
 ## 工作主线
 

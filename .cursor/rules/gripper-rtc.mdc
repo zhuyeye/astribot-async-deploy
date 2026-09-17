@@ -1,0 +1,33 @@
+---
+description: Causal gripper post-process and proven Costa RTC deploy params
+globs: control/**/*.py,run_async_deploy.py,runner.py,README.md
+alwaysApply: false
+---
+
+# Gripper + RTC (locked)
+
+## Causal gripper (do not regress)
+
+- **Ingest**: blend arms only; store **continuous** gripper raw. Never run GripperPost on `[k_now:]` (lookahead closes early on H=20).
+- **Sample**: advance sticky binary SM only when the **active keyframe index** moves; hold last discrete between keys. Current + history only.
+- Defaults: `close_enter=70`, `open_enter=40`, `close_confirm=2`, `open_confirm=5`, `min_close_hold_s=1.2`, `min_open_hold_s=0.35`, `blend_grippers=False`.
+
+## Proven Costa handover launch (Orin → 192.168.0.100)
+
+Prefer RTC + moderate send rate; H=20 early-grasp was fixed by causal SM, not by dropping H.
+
+```bash
+./scripts/start_async.sh \
+  --host 192.168.0.100 --port 8003 \
+  --protocol pi05 \
+  --send-hz 10 --chunk-hz 30 --ctrl-hz 250 \
+  --blend-s 0.12 --freeze-chassis \
+  --gripper-binary \
+  --gripper-close-enter 70 --gripper-open-enter 40 \
+  --gripper-close-confirm 2 --gripper-open-confirm 5 \
+  --gripper-min-close-hold-s 1.2 --gripper-min-open-hold-s 0.35
+```
+
+- Do **not** reintroduce ingest-time full-suffix gripper discretization.
+- H=10 is safer if causal SM is absent; with causal SM, H=20 is OK.
+- Uneven arm speed on traces is usually **policy rhythm** (only ~3/20 frames played), not RTT jitter.

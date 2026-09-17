@@ -297,7 +297,11 @@ class TraceLogger:
         if after_blend_keys is not None and after_blend_keys.shape[0]:
             payload["grip_L_before"] = [float(v) for v in before_keys[:, LEFT_GRIPPER_IDX]]
             payload["grip_L_blend"] = [float(v) for v in after_blend_keys[:, LEFT_GRIPPER_IDX]]
-            payload["grip_L_discrete"] = [float(v) for v in after_keys[:, LEFT_GRIPPER_IDX]]
+            # after_keys keep continuous grippers; discrete happens on sample.
+            payload["grip_L_traj"] = [float(v) for v in after_keys[:, LEFT_GRIPPER_IDX]]
+            payload["grip_L_discrete"] = payload["grip_L_traj"]  # back-compat alias
+            payload["grip_R_before"] = [float(v) for v in before_keys[:, RIGHT_GRIPPER_IDX]]
+            payload["grip_R_traj"] = [float(v) for v in after_keys[:, RIGHT_GRIPPER_IDX]]
         if self._should_save_arrays(self._ingest_i):
             arrays = {
                 "before_keys": np.asarray(before_keys, dtype=np.float32),

@@ -1,0 +1,11 @@
+---
+description: Never start Astribot robot services as user zhuye
+alwaysApply: true
+---
+
+# Astribot service user
+
+- **Do not** start, restart, or run official robot services / drivers as user `zhuye`.
+- Official stack (camera, recorder, launch, etc.) runs as `astribot` / `nobody`. Starting as `zhuye` breaks shared state (e.g. `/dev/shm/astribot_camera*`) and can block the real service.
+- To start/stop cameras or similar: use the official UI, or `ros2 service call` / scripts **as the service user** (`astribot`), never manual `zhuye` binaries.
+- Diagnosis as `zhuye` is OK (read logs, `ros2 topic hz`, `lsusb`). Do not `nohup` / directly exec `astribot_camera_main`, `astribot_camera_sub`, recorder server, etc. under `zhuye`.

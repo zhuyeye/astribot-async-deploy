@@ -200,7 +200,7 @@ def test_gripper_binary_only_processes_playable_suffix():
     assert float(bridge.sample(100.0)[14]) == 100.0
 
     # Second chunk arrives with ~5 frames of latency (k_now≈5). Prefix is open,
-    # suffix from k_now is closed. Old bug: processing prefix would open.
+    # suffix from k_now is closed. Causal sample never visits prefix → stay closed.
     obs_ts = 100.2
     now = obs_ts + 5.0 / 30.0  # k_now == 5
     a2 = np.zeros((20, 25), dtype=np.float32)
@@ -213,13 +213,62 @@ def test_gripper_binary_only_processes_playable_suffix():
     k_now = bridge._blend_start_index(t0=obs_ts, now=now, horizon=20)  # noqa: SLF001
     assert k_now == 5
 
-    # Playable seam should stay closed (suffix only saw close intent).
     cmd = bridge.sample(now)
     assert cmd is not None
     assert float(cmd[14]) == 100.0
     assert float(cmd[22]) == 100.0
-    # Prefix slots are filled from suffix seam for safety.
-    assert float(bridge._keys[0, 14]) == 100.0  # noqa: SLF001
+    # Trajectory stores continuous raw (prefix stays open in the buffer).
+    assert float(bridge._keys[0, 14]) == 0.0  # noqa: SLF001
+
+
+def test_gripper_sm_ignores_unplayed_future_close():
+    """H=20 early-grasp bug: close in chunk tail must not latch until sampled."""
+    bridge = ChunkTrajBridge(
+        ChunkTrajConfig(
+            chunk_hz=30.0,
+            blend_s=0.0,
+            use_obs_timestamp=True,
+            playback_lead_s=0.0,
+            gripper_binary=True,
+            gripper_close_enter=70.0,
+            gripper_open_enter=40.0,
+            gripper_close_confirm=2,
+            gripper_open_confirm=5,
+            gripper_min_close_hold_s=0.0,
+            gripper_min_open_hold_s=0.0,
+        )
+    )
+    bridge.seed_gripper_from_state(np.zeros(25, dtype=np.float32))
+
+    t0 = 100.0
+    a = np.zeros((20, 25), dtype=np.float32)
+    a[:, 14] = 0.0
+    a[17:, 14] = 100.0  # close only in unplayed tail
+    a[:, 7] = np.linspace(0.0, 0.4, 20, dtype=np.float32)
+    bridge.ingest(a, obs_timestamp=t0, now=t0)
+
+    # Play ~3 frames like send-hz≈10 (100ms).
+    for i in range(3):
+        cmd = bridge.sample(t0 + i / 30.0)
+        assert cmd is not None
+        assert float(cmd[14]) == 0.0, f"early close at key {i}"
+
+    # Next chunk still open at head; must not inherit a phantom close.
+    t1 = t0 + 0.1
+    a2 = np.zeros((20, 25), dtype=np.float32)
+    a2[:, 14] = 0.0
+    a2[17:, 14] = 100.0
+    a2[:, 7] = np.linspace(0.4, 0.8, 20, dtype=np.float32)
+    bridge.ingest(a2, obs_timestamp=t1, now=t1)
+    cmd2 = bridge.sample(t1)
+    assert cmd2 is not None
+    assert float(cmd2[14]) == 0.0
+
+    # Only when playback reaches the close keys does SM latch.
+    for i in range(17, 20):
+        cmd = bridge.sample(t1 + i / 30.0)
+        assert cmd is not None
+    assert float(cmd[14]) == 100.0
 
 
 def test_fresh_obs_timestamp_keeps_original_timeline():

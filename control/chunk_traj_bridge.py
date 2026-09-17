@@ -23,7 +23,7 @@ class ChunkTrajConfig:
     # executor does not jump straight to the chunk tail.
     playback_lead_s: float = 0.05
     # Grippers: skip cross-chunk blend by default; VLA should hold a stable
-    # open/close band, then binary sticky discretizes to {0,100}.
+    # open/close band, then binary sticky discretizes to {0,100} on sample.
     blend_grippers: bool = False
     gripper_binary: bool = True
     # Hysteresis on SDK [0,100]: close >=70, open <=40.
@@ -45,16 +45,16 @@ class ChunkTrajBridge:
       1) linear blend ``blend_s`` keyframes at the ingest seam (``k_now`` on the
          obs_timestamp timeline when enabled, else key 0) from last sample
          (arms/joints; grippers only if ``blend_grippers``)
-      2) discretize grippers (binary sticky) only on the playable suffix
-         ``[k_now:]`` so discarded prefix frames cannot advance confirm/hold
-      3) sample: joints linear; grippers ZOH after discretization
+      2) store continuous gripper targets (no lookahead binarization at ingest)
+      3) sample: joints linear; grippers advance the sticky SM only when the
+         active keyframe index moves forward (current + history, never future)
     """
 
     def __init__(self, config: ChunkTrajConfig | None = None) -> None:
         self._cfg = config or ChunkTrajConfig()
         self._lock = threading.Lock()
         self._times: np.ndarray | None = None  # (T,) absolute time
-        self._keys: np.ndarray | None = None  # (T, 25) SDK units (post-discrete)
+        self._keys: np.ndarray | None = None  # (T, 25) SDK units (raw grippers)
         self._last_sample: np.ndarray | None = None
         self._gripper_post = GripperPostProcessor(
             GripperPostConfig(
@@ -71,6 +71,8 @@ class ChunkTrajBridge:
             )
         )
         self._gripper_seeded = False
+        self._traj_id = 0
+        self._last_grip_step: tuple[int, int] | None = None  # (traj_id, key_idx)
 
     def reset(self) -> None:
         with self._lock:
@@ -79,6 +81,8 @@ class ChunkTrajBridge:
             self._last_sample = None
             self._gripper_post.reset()
             self._gripper_seeded = False
+            self._traj_id = 0
+            self._last_grip_step = None
 
     def seed_gripper_from_state(self, state_25: np.ndarray) -> None:
         with self._lock:
@@ -119,7 +123,7 @@ class ChunkTrajBridge:
                 t0 = now + lead_s
 
         times = t0 + np.arange(horizon, dtype=np.float64) / float(self._cfg.chunk_hz)
-        # Playable seam on the (possibly rebased) timeline; used for blend + gripper post.
+        # Playable seam on the (possibly rebased) timeline; used for blend.
         k_now = self._blend_start_index(t0=t0, now=now, horizon=horizon)
 
         with self._lock:
@@ -146,21 +150,11 @@ class ChunkTrajBridge:
                     blend_n = 0
 
             after_blend = keys.copy()
-            # Binarize only the playable suffix so discarded prefix cannot
-            # advance open_confirm / close_confirm / hold state.
-            suffix = keys[k_now:].copy()
-            suffix = self._gripper_post.process_keyframes(
-                suffix,
-                t0=float(times[k_now]),
-                hz=float(self._cfg.chunk_hz),
-            )
-            keys[k_now:] = suffix
-            if k_now > 0:
-                for gi in GRIPPER_INDICES:
-                    keys[:k_now, gi] = keys[k_now, gi]
-
+            # Keep continuous grippers in the traj; SM runs on sample only.
             self._times = times
             self._keys = keys
+            self._traj_id += 1
+            self._last_grip_step = None
 
         tracer = get_tracer()
         if tracer is not None:
@@ -180,6 +174,14 @@ class ChunkTrajBridge:
         with self._lock:
             return self._keys is not None and self._times is not None
 
+    def _active_key_index(self, t: float, times: np.ndarray) -> int:
+        if t <= times[0]:
+            return 0
+        if t >= times[-1]:
+            return int(len(times) - 1)
+        idx = int(np.searchsorted(times, t, side="right") - 1)
+        return int(np.clip(idx, 0, len(times) - 1))
+
     def sample(self, t: float | None = None) -> np.ndarray | None:
         t = time.perf_counter() if t is None else float(t)
         with self._lock:
@@ -187,7 +189,9 @@ class ChunkTrajBridge:
                 return None
             times = self._times
             keys = self._keys
+            traj_id = self._traj_id
 
+            key_idx = self._active_key_index(t, times)
             if t <= times[0]:
                 out = keys[0].copy()
             elif t >= times[-1]:
@@ -200,12 +204,25 @@ class ChunkTrajBridge:
                 u = float(np.clip(u, 0.0, 1.0))
                 out = keys[idx].copy()
                 for dim in range(JOINT_DIM):
-                    # After binary post, grippers are {0,100}: ZOH between keys.
-                    # Continuous mode: linear interpolate grippers too.
-                    if dim in GRIPPER_INDICES and self._cfg.gripper_binary:
-                        out[dim] = keys[idx, dim]
+                    if dim in GRIPPER_INDICES:
+                        # Continuous raw: ZOH on the active key (SM decides open/close).
+                        out[dim] = keys[key_idx, dim]
                     else:
                         out[dim] = (1.0 - u) * float(keys[idx, dim]) + u * float(keys[idx + 1, dim])
+
+            if self._cfg.gripper_binary:
+                step_id = (traj_id, key_idx)
+                if self._last_grip_step != step_id:
+                    out = self._gripper_post.process_cmd(out, t_now=t)
+                    self._last_grip_step = step_id
+                else:
+                    # Hold last discrete gripper outputs between key advances.
+                    for gi in GRIPPER_INDICES:
+                        last = self._gripper_post.last_out(gi)
+                        if last is not None:
+                            out[gi] = float(last)
+            else:
+                out = self._gripper_post.process_cmd(out, t_now=t)
 
             self._last_sample = out.copy()
             return out
